@@ -86,6 +86,9 @@ import {
 } from "./reality-bridge/storage";
 import { validateOwnedAppImageReference } from "./image-generation-reference-policy";
 
+const CUSTOM_APP_MEDIA_REFS_COLLECTION = "__media_refs";
+const CUSTOM_APP_IMAGE_REFERENCE_MAX_BYTES = 25_000_000;
+
 const CUSTOM_APP_NOTIFICATIONS_KEY = "ai_phone_custom_app_notifications_v1";
 const CUSTOM_APP_BADGES_KEY = "ai_phone_custom_app_badges_v1";
 const CUSTOM_APP_TASKS_KEY = "ai_phone_custom_app_tasks_v1";
