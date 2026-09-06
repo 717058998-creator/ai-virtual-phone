@@ -595,7 +595,7 @@ export async function generateImageFromConfiguredApi(params: {
     revisedPrompt: data.revisedPrompt,
     usedCharacterReferenceImage,
     usedUserReferenceImage,
-    userReferenceImageRequested,
+    userReferenceImageRequested: userReferenceRequested,
     userReferenceImageStatus,
     userReferenceImageMessage,
   };
