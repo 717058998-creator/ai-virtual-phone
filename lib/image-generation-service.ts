@@ -3,6 +3,10 @@ import { loadImageGenerationSettings } from "./settings-storage";
 import { getChatImageFromIndexedDB } from "./chat-asset-storage";
 import { storeMediaBlob } from "./media-cache-storage";
 import { throwIfAborted } from "./abort-utils";
+import { getUserReferenceImagePolicy, isReferenceInputUnsupportedError, redactImageGenerationError } from "./image-generation-reference-policy";
+
+export type UserReferenceImageStatus = "not_requested" | "used" | "fallback_prompt";
+export type AppUserReferenceImage = { dataUrl: string; mimeType: string };
 
 export type ImageGenerationResult = {
   mediaRef: string;
@@ -12,6 +16,11 @@ export type ImageGenerationResult = {
   prompt: string;
   usedReferenceImage: boolean;
   revisedPrompt?: string;
+  usedCharacterReferenceImage: boolean;
+  usedUserReferenceImage: boolean;
+  userReferenceImageRequested: boolean;
+  userReferenceImageStatus: UserReferenceImageStatus;
+  userReferenceImageMessage?: string;
 };
 
 type ExtractedImage =
@@ -231,7 +240,7 @@ async function parseImageGenerationResponse(res: Response, signal?: AbortSignal)
   const contentType = (res.headers.get("content-type") || "").toLowerCase();
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(`生图 API 错误 ${res.status}: ${text.slice(0, 600)}`);
+    throw new Error(redactImageGenerationError(`生图 API 错误 ${res.status}: ${text}`));
   }
 
   if (contentType.startsWith("image/")) {
@@ -313,28 +322,30 @@ export const IMAGE_GEN_PROXY_URL = (process.env.NEXT_PUBLIC_IMAGE_GEN_PROXY_URL 
 async function generateImageDirect(params: {
   settings: ImageGenerationSettings;
   prompt: string;
-  referenceImageDataUrl: string | null;
+  referenceImageDataUrls: string[];
   signal?: AbortSignal;
   /** 走通用代理:请求发往代理地址,真实上游放进 x-upstream-base-url 头 */
   proxyBaseUrl?: string;
 }): Promise<ImageGenerationApiResponse> {
-  const { settings, prompt, referenceImageDataUrl, signal, proxyBaseUrl } = params;
+  const { settings, prompt, referenceImageDataUrls, signal, proxyBaseUrl } = params;
   throwIfAborted(signal);
-  const hasReference = Boolean(referenceImageDataUrl);
+  const hasReference = referenceImageDataUrls.length > 0;
   const url = buildImageUrl(proxyBaseUrl || settings.baseUrl, hasReference ? "edits" : "generations");
   const headers: Record<string, string> = { Authorization: `Bearer ${settings.apiKey}` };
   if (proxyBaseUrl) headers["x-upstream-base-url"] = normalizeBaseUrl(settings.baseUrl);
   let body: BodyInit;
 
   if (hasReference) {
-    const converted = dataUrlToBlob(referenceImageDataUrl || "");
-    if (!converted) throw new Error("参考图格式无效");
     const form = new FormData();
     form.set("model", settings.model);
     form.set("prompt", prompt);
     if (settings.size && settings.size !== "auto") form.set("size", settings.size);
     if (settings.quality && settings.quality !== "auto") form.set("quality", settings.quality);
-    form.append("image", converted.blob, `reference.${imageExtension(converted.mimeType)}`);
+    referenceImageDataUrls.forEach((dataUrl, index) => {
+      const converted = dataUrlToBlob(dataUrl || "");
+      if (!converted) throw new Error("参考图格式无效");
+      form.append("image", converted.blob, `reference-${index + 1}.${imageExtension(converted.mimeType)}`);
+    });
     body = form;
   } else {
     headers["Content-Type"] = "application/json";
@@ -381,7 +392,7 @@ const directCorsFailedBaseUrls = new Set<string>();
 async function generateImageViaServerOrProxy(params: {
   settings: ImageGenerationSettings;
   prompt: string;
-  referenceImageDataUrl: string | null;
+  referenceImageDataUrls: string[];
   signal?: AbortSignal;
 }): Promise<ImageGenerationApiResponse> {
   if (IMAGE_GEN_PROXY_URL) {
@@ -414,10 +425,10 @@ async function generateImageViaServerOrProxy(params: {
 async function generateImageViaServer(params: {
   settings: ImageGenerationSettings;
   prompt: string;
-  referenceImageDataUrl: string | null;
+  referenceImageDataUrls: string[];
   signal?: AbortSignal;
 }): Promise<ImageGenerationApiResponse> {
-  const { settings, prompt, referenceImageDataUrl, signal } = params;
+  const { settings, prompt, referenceImageDataUrls, signal } = params;
   throwIfAborted(signal);
   // 防"无限卡住":函数被平台中途击杀时流可能既不关闭也不报错。
   // 总超时 180s + 断流检测(心跳每 3s 一个字节,超过 25s 没有任何字节视为断流)。
@@ -439,7 +450,8 @@ async function generateImageViaServer(params: {
         prompt,
         size: settings.size,
         quality: settings.quality,
-        referenceImageDataUrl: referenceImageDataUrl || undefined,
+        referenceImageDataUrl: referenceImageDataUrls[0] || undefined,
+        ...(referenceImageDataUrls.length > 1 ? { referenceImageDataUrls } : {}),
       }),
     });
     throwIfAborted(signal);
@@ -482,14 +494,14 @@ async function generateImageViaServer(params: {
       }
       throwIfAborted(signal);
       if (data.error || !data.b64) {
-        throw new Error(data.error || `生图请求失败 ${data.httpStatus ?? res.status}`);
+        throw new Error(redactImageGenerationError(`生图 API 错误 ${data.httpStatus ?? res.status}: ${data.error || "未知错误"}`));
       }
     } else {
       // 非流式回退(旧服务端等)
       data = await res.json().catch(() => ({})) as ServerImagePayload;
       throwIfAborted(signal);
       if (!res.ok || data.error || !data.b64) {
-        throw new Error(data.error || `生图请求失败 ${res.status}`);
+        throw new Error(redactImageGenerationError(`生图 API 错误 ${data.httpStatus ?? res.status}: ${data.error || "未知错误"}`));
       }
     }
     return { b64: data.b64, mimeType: data.mimeType, revisedPrompt: data.revisedPrompt };
@@ -503,6 +515,7 @@ export async function generateImageFromConfiguredApi(params: {
   description: string;
   characterId?: string;
   useReferenceImage?: boolean;
+  appUserReferenceImage?: AppUserReferenceImage;
   settings?: ImageGenerationSettings;
   signal?: AbortSignal;
 }): Promise<ImageGenerationResult | null> {
@@ -513,19 +526,54 @@ export async function generateImageFromConfiguredApi(params: {
   if (!description || !settings.apiKey.trim() || !settings.baseUrl.trim() || !settings.model.trim()) return null;
 
   const reference = params.characterId ? settings.characterReferences[params.characterId] : undefined;
-  const rawReferenceImageDataUrl = params.useReferenceImage && reference?.assetId
+  const rawCharacterReferenceImageDataUrl = params.useReferenceImage && reference?.assetId
     ? await getChatImageFromIndexedDB(reference.assetId)
     : null;
   throwIfAborted(params.signal);
-  const referenceImageDataUrl = rawReferenceImageDataUrl
-    ? await normalizeReferenceImageForEdit(rawReferenceImageDataUrl)
+  const characterReferenceImageDataUrl = rawCharacterReferenceImageDataUrl
+    ? await normalizeReferenceImageForEdit(rawCharacterReferenceImageDataUrl)
     : null;
   throwIfAborted(params.signal);
-  const prompt = mergePrompt(description, settings.extraPrompt);
+  
+  const userReferenceRequested = Boolean(params.appUserReferenceImage?.dataUrl);
+  const userPolicy = getUserReferenceImagePolicy(settings.model);
+  let userReferenceImageDataUrl: string | null = null;
+  let userReferenceImageStatus: UserReferenceImageStatus = userReferenceRequested ? "used" : "not_requested";
+  let userReferenceImageMessage: string | undefined;
 
-  const data = settings.requestMode === "direct"
-    ? await generateImageDirect({ settings, prompt, referenceImageDataUrl, signal: params.signal })
-    : await generateImageViaServerOrProxy({ settings, prompt, referenceImageDataUrl, signal: params.signal });
+  if (userReferenceRequested) {
+    if (userPolicy.canAttemptImageInput) {
+      userReferenceImageDataUrl = await normalizeReferenceImageForEdit(params.appUserReferenceImage!.dataUrl);
+    } else {
+      userReferenceImageStatus = "fallback_prompt";
+      userReferenceImageMessage = "当前模型不支持 App 用户参考图，已使用提示词生成。";
+    }
+  }
+  throwIfAborted(params.signal);
+
+  const prompt = mergePrompt(description, settings.extraPrompt);
+  
+  const getReferenceArray = () => [userReferenceImageDataUrl, characterReferenceImageDataUrl].filter(Boolean) as string[];
+  let referenceImageDataUrls = getReferenceArray();
+
+  const performRequest = () => settings.requestMode === "direct"
+    ? generateImageDirect({ settings, prompt, referenceImageDataUrls, signal: params.signal })
+    : generateImageViaServerOrProxy({ settings, prompt, referenceImageDataUrls, signal: params.signal });
+
+  let data;
+  try {
+    data = await performRequest();
+  } catch (error) {
+    if (userReferenceRequested && userReferenceImageDataUrl && isReferenceInputUnsupportedError(error)) {
+      userReferenceImageDataUrl = null;
+      userReferenceImageStatus = "fallback_prompt";
+      userReferenceImageMessage = "当前服务商未接受 App 用户参考图，已使用提示词生成。";
+      referenceImageDataUrls = getReferenceArray();
+      data = await performRequest();
+    } else {
+      throw error;
+    }
+  }
 
   throwIfAborted(params.signal);
   const mimeType = data.mimeType || "image/png";
@@ -533,14 +581,23 @@ export async function generateImageFromConfiguredApi(params: {
   throwIfAborted(params.signal);
   const mediaRef = await storeMediaBlob(blob, mimeType, "image");
   throwIfAborted(params.signal);
+  
+  const usedCharacterReferenceImage = Boolean(characterReferenceImageDataUrl);
+  const usedUserReferenceImage = Boolean(userReferenceImageDataUrl);
+  
   return {
     mediaRef,
     dataUrl: `data:${mimeType};base64,${data.b64}`,
     blob,
     mimeType,
     prompt,
-    usedReferenceImage: Boolean(referenceImageDataUrl),
+    usedReferenceImage: usedCharacterReferenceImage || usedUserReferenceImage,
     revisedPrompt: data.revisedPrompt,
+    usedCharacterReferenceImage,
+    usedUserReferenceImage,
+    userReferenceImageRequested,
+    userReferenceImageStatus,
+    userReferenceImageMessage,
   };
 }
 

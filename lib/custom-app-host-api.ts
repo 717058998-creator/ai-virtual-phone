@@ -83,6 +83,7 @@ import {
   readBridgeStateSnapshot,
   sanitizeBridgeDataKey,
 } from "./reality-bridge/storage";
+import { validateOwnedAppImageReference } from "./image-generation-reference-policy";
 
 const CUSTOM_APP_NOTIFICATIONS_KEY = "ai_phone_custom_app_notifications_v1";
 const CUSTOM_APP_BADGES_KEY = "ai_phone_custom_app_badges_v1";
@@ -1366,14 +1367,38 @@ export async function runCustomAppAiClassify(app: InstalledCustomApp, record: Re
   return { label, raw };
 }
 
+async function resolveOwnedCustomAppUserReferenceImage(app: InstalledCustomApp, refValue: unknown): Promise<{ dataUrl: string; mimeType: string } | undefined> {
+  const ref = cleanText(refValue, 240);
+  if (!ref) return undefined;
+  
+  const ownedRows = readCustomAppCollection(app.id, CUSTOM_APP_MEDIA_REFS_COLLECTION);
+  let media = null;
+  if (ref.startsWith("media-store://")) {
+    const loaded = await loadMediaBlob(ref);
+    if (loaded) {
+      media = { category: loaded.category, mimeType: loaded.mimeType, bytes: loaded.blob.size };
+    }
+  }
+  
+  validateOwnedAppImageReference({ ref, ownedRows, media, maxBytes: CUSTOM_APP_IMAGE_REFERENCE_MAX_BYTES });
+  
+  const loaded = await loadMediaBlob(ref);
+  if (!loaded) throw new Error("App 用户参考图已被删除或不可用。");
+  const dataUrl = await blobToDataUrl(loaded.blob);
+  return { dataUrl, mimeType: loaded.mimeType };
+}
+
 export async function generateCustomAppImage(app: InstalledCustomApp, record: Record<string, unknown>): Promise<Record<string, unknown>> {
   const description = cleanText(record.prompt ?? record.description, 4000);
   if (!description) throw new Error("ai.generateImage 需要 prompt。");
   const characterId = cleanText(record.characterId, 160) || undefined;
   const useReferenceImage = record.useReferenceImage === true;
   const timeoutMs = optionalCustomAppTimeoutMs(record.timeoutMs);
+  
+  const appUserReferenceImage = await resolveOwnedCustomAppUserReferenceImage(app, record.userReferenceImageRef);
+
   const result = await withOptionalCustomAppTimeout(timeoutMs, "ai.generateImage", signal => (
-    generateImageFromConfiguredApi({ description, characterId, useReferenceImage, signal })
+    generateImageFromConfiguredApi({ description, characterId, useReferenceImage, appUserReferenceImage, signal })
   ));
   if (!result) throw new Error("生图功能未配置或未启用，请先在小手机设置里配置生图 API。");
   return {
@@ -1383,6 +1408,11 @@ export async function generateCustomAppImage(app: InstalledCustomApp, record: Re
     prompt: result.prompt,
     revisedPrompt: result.revisedPrompt,
     usedReferenceImage: result.usedReferenceImage,
+    usedCharacterReferenceImage: result.usedCharacterReferenceImage,
+    usedUserReferenceImage: result.usedUserReferenceImage,
+    userReferenceImageRequested: result.userReferenceImageRequested,
+    userReferenceImageStatus: result.userReferenceImageStatus,
+    userReferenceImageMessage: result.userReferenceImageMessage,
   };
 }
 

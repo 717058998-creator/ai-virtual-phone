@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { ProxyAgent, type Dispatcher } from "undici";
+import { redactImageGenerationError } from "@/lib/image-generation-reference-policy";
 
 export const maxDuration = 120;
 
@@ -11,6 +12,7 @@ type ImageGenerationRequest = {
   size?: string;
   quality?: string;
   referenceImageDataUrl?: string;
+  referenceImageDataUrls?: string[];
 };
 
 type ExtractedImage =
@@ -123,7 +125,14 @@ async function runImageGeneration(input: ImageGenerationRequest): Promise<{ stat
     const baseUrl = input.baseUrl?.trim();
     const model = input.model?.trim();
     const prompt = input.prompt?.trim();
-    const hasReference = Boolean(input.referenceImageDataUrl?.trim());
+    
+    let referenceUrls = (Array.isArray(input.referenceImageDataUrls) ? input.referenceImageDataUrls : [])
+      .filter(u => typeof u === "string" && u.trim().startsWith("data:image/"))
+      .slice(0, 2);
+    if (referenceUrls.length === 0 && input.referenceImageDataUrl?.trim()) {
+      referenceUrls = [input.referenceImageDataUrl.trim()];
+    }
+    const hasReference = referenceUrls.length > 0;
 
     if (!apiKey) return { status: 400, body: { error: "缺少 API Key" } };
     if (!baseUrl) return { status: 400, body: { error: "缺少 Base URL" } };
@@ -135,14 +144,17 @@ async function runImageGeneration(input: ImageGenerationRequest): Promise<{ stat
     let body: BodyInit;
 
     if (hasReference) {
-      const converted = dataUrlToBlob(input.referenceImageDataUrl || "");
-      if (!converted) return { status: 400, body: { error: "参考图格式无效" } };
       const form = new FormData();
       form.set("model", model);
       form.set("prompt", prompt);
       if (input.size && input.size !== "auto") form.set("size", input.size);
       if (input.quality && input.quality !== "auto") form.set("quality", input.quality);
-      form.append("image", converted.blob, `reference.${converted.mimeType.split("/")[1] || "png"}`);
+      
+      for (let i = 0; i < referenceUrls.length; i++) {
+        const converted = dataUrlToBlob(referenceUrls[i]);
+        if (!converted) return { status: 400, body: { error: "参考图格式无效" } };
+        form.append("image", converted.blob, `reference-${i + 1}.${converted.mimeType.split("/")[1] || "png"}`);
+      }
       body = form;
     } else {
       headers["Content-Type"] = "application/json";
@@ -166,7 +178,7 @@ async function runImageGeneration(input: ImageGenerationRequest): Promise<{ stat
     const contentType = (res.headers.get("content-type") || "").toLowerCase();
     if (!res.ok) {
       const errText = await res.text().catch(() => "");
-      return { status: 502, body: { error: `生图 API 错误 ${res.status}: ${errText.slice(0, 600)}` } };
+      return { status: 502, body: { error: redactImageGenerationError(`生图 API 错误 ${res.status}: ${errText}`) } };
     }
 
     if (contentType.startsWith("image/")) {
@@ -177,7 +189,7 @@ async function runImageGeneration(input: ImageGenerationRequest): Promise<{ stat
     const json = await res.json();
     const extracted = extractFromObject(json);
     if (!extracted) {
-      return { status: 502, body: { error: `生图 API 返回中没有找到图片字段：${JSON.stringify(Object.keys(json || {})).slice(0, 200)}` } };
+      return { status: 502, body: { error: redactImageGenerationError(`生图 API 返回中没有找到图片字段：${JSON.stringify(Object.keys(json || {})).slice(0, 200)}`) } };
     }
 
     if (extracted.kind === "url") {
@@ -196,7 +208,7 @@ async function runImageGeneration(input: ImageGenerationRequest): Promise<{ stat
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     const status = message.toLowerCase().includes("abort") ? 504 : 502;
-    return { status, body: { error: message } };
+    return { status, body: { error: redactImageGenerationError(message) } };
   }
 }
 
