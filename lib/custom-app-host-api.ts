@@ -38,6 +38,7 @@ import {
   replaceCalendarWeekItems,
   upsertCalendarScheduleItem,
 } from "./calendar-storage";
+import { loadMediaBlob } from "./media-cache-storage";
 import type { CalendarOwnerType, CalendarScheduleItem } from "./calendar-types";
 import { formatIsoDate, getWeekStartIso, normalizeTime } from "./calendar-utils";
 import { simpleLLMCall } from "./api-helpers";
