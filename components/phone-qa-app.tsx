@@ -7,7 +7,7 @@ import remarkGfm from "remark-gfm";
 // （** 后跟标点时要求前面是空格/标点，中文里前面通常是汉字），中文消息大量中招。
 import remarkCjkFriendly from "remark-cjk-friendly";
 import remarkBreaks from "remark-breaks";
-import { AppWindow, ArrowUp, BrushCleaning, Check, ChevronLeft, ChevronRight, Copy, Drama, FileCode2, FileText, Gamepad2, Github, Image as ImageIcon, Loader2, Menu, MoreVertical, Paperclip, Pencil, Pin, PinOff, Play, Plus, Square, Trash2, Wrench, X } from "lucide-react";
+import { AppWindow, ArrowUp, BrushCleaning, Check, ChevronDown, ChevronLeft, ChevronRight, Copy, Drama, FileCode2, FileText, Gamepad2, Github, Image as ImageIcon, Loader2, Menu, MoreVertical, Paperclip, Pencil, Pin, PinOff, Play, Plus, Square, Trash2, Wrench, X } from "lucide-react";
 import { getQaApiLogs, clearQaApiLogs, type DebugInfo } from "@/lib/api-log-store";
 import { QaFileCard } from "@/components/qa-file-card";
 import { parseQaFileMarker } from "@/lib/qa-computer-tools";
@@ -806,6 +806,9 @@ function QaRepoSheet({ onClose, onSaved }: { onClose: () => void; onSaved: () =>
   );
 }
 
+// ── 跨会话滚动位置记忆 ────────────────────────────────
+const qaSessionScrollState = new Map<string, { top: number; stickToBottom: boolean }>();
+
 // ── App 本体 ─────────────────────────────────────────
 
 export function PhoneQaApp({ onClose, onNotice }: PhoneQaAppProps) {
@@ -841,6 +844,8 @@ export function PhoneQaApp({ onClose, onNotice }: PhoneQaAppProps) {
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const stickToBottomRef = useRef(true);
+  const [showScrollBottom, setShowScrollBottom] = useState(false);
+  const [hasUnreadNew, setHasUnreadNew] = useState(false);
 
   const refreshComposerMeta = useCallback(() => {
     setApiReady(resolveQaApiConfig() != null);
@@ -899,17 +904,79 @@ export function PhoneQaApp({ onClose, onNotice }: PhoneQaAppProps) {
     [previewItem],
   );
 
-  // 自动滚动：用户上滚阅读时不拉回底部
+  const scrollToBottom = useCallback((smooth = true) => {
+    const el = bodyRef.current;
+    if (!el) return;
+    stickToBottomRef.current = true;
+    setShowScrollBottom(false);
+    setHasUnreadNew(false);
+    if (snapshot.activeSessionId) {
+      qaSessionScrollState.set(snapshot.activeSessionId, {
+        top: el.scrollHeight,
+        stickToBottom: true,
+      });
+    }
+    if (smooth) {
+      el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+    } else {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [snapshot.activeSessionId]);
+
+  // 自动滚动：用户上滚阅读时不拉回底部，并显示一键直达底部按钮
   const handleScroll = useCallback(() => {
     const el = bodyRef.current;
     if (!el) return;
-    stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-  }, []);
+    const isNear = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    stickToBottomRef.current = isNear;
+    setShowScrollBottom(!isNear);
+    if (isNear) {
+      setHasUnreadNew(false);
+    }
+    if (snapshot.activeSessionId) {
+      qaSessionScrollState.set(snapshot.activeSessionId, {
+        top: el.scrollTop,
+        stickToBottom: isNear,
+      });
+    }
+  }, [snapshot.activeSessionId]);
 
+  // 进入会话 / 切换会话时恢复滚动位置，若在底部则启动短期持续贴底校准（对抗 ReactMarkdown / 图片异步 layout）
   useEffect(() => {
     const el = bodyRef.current;
-    if (el && stickToBottomRef.current) {
+    if (!el || !snapshot.activeSessionId) return;
+
+    const saved = qaSessionScrollState.get(snapshot.activeSessionId);
+    const shouldStick = saved ? saved.stickToBottom : true;
+    stickToBottomRef.current = shouldStick;
+
+    if (saved && !saved.stickToBottom) {
+      el.scrollTop = saved.top;
+      setShowScrollBottom(true);
+    } else {
       el.scrollTop = el.scrollHeight;
+      setShowScrollBottom(false);
+      let count = 0;
+      const timer = setInterval(() => {
+        if (!stickToBottomRef.current || !el) {
+          clearInterval(timer);
+          return;
+        }
+        el.scrollTop = el.scrollHeight;
+        if (++count >= 10) clearInterval(timer);
+      }, 60);
+      return () => clearInterval(timer);
+    }
+  }, [snapshot.activeSessionId]);
+
+  // 消息变化时（新消息落库或流式输出）：若处在底部则自动跟随，若不在底部则点亮未读提示
+  useEffect(() => {
+    const el = bodyRef.current;
+    if (!el) return;
+    if (stickToBottomRef.current) {
+      el.scrollTop = el.scrollHeight;
+    } else {
+      setHasUnreadNew(true);
     }
   }, [messages]);
 
@@ -1145,6 +1212,18 @@ export function PhoneQaApp({ onClose, onNotice }: PhoneQaAppProps) {
       </div>
 
       <footer className="qa-composer-wrap">
+        {showScrollBottom && (
+          <button
+            type="button"
+            className={`qa-scroll-bottom-btn ${hasUnreadNew ? "has-unread" : ""}`}
+            onClick={() => scrollToBottom(true)}
+            aria-label="直达底部"
+            title="直达底部"
+          >
+            <ChevronDown size={18} strokeWidth={2.2} />
+            {hasUnreadNew && <span className="qa-scroll-bottom-dot" />}
+          </button>
+        )}
         <div className={`qa-composer ${snapshot.isGenerating ? "is-generating" : ""}`}>
           {pendingImages.length > 0 && (
             <div className="qa-attach-strip">
