@@ -673,7 +673,7 @@
   to { opacity: 1; }
 }
 
-/* ── 一键直达底部悬浮按钮 ── */
+/* ── 一键直达底部悬浮按钮 (ci-trigger) ── */
 .qa-scroll-bottom-btn {
   position: absolute;
   top: -38px;
