@@ -562,7 +562,8 @@ function QaSessionDrawer({
               </div>
             )}
           </div>
-        ))}
+        );
+      })}
       </div>
       <div className="qa-drawer-foot">
         <button type="button" className="qa-drawer-new qa-drawer-settings" onClick={onOpenSettings}>
